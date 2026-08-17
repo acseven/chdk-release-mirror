@@ -21,6 +21,8 @@ import tarfile
 import urllib.request
 
 BUILD_INFO = "https://build.chdk.photos/builds/release/meta/build_info.json"
+# Trunk feed is used only to mark cameras that have no stable release yet.
+TRUNK_BUILD_INFO = "https://build.chdk.photos/builds/trunk/meta/build_info.json"
 BASE = "https://build.chdk.photos"
 REPO = os.environ.get("MIRROR_REPO", "acseven/chdk-release-mirror")
 
@@ -34,12 +36,31 @@ SVN_USER, SVN_PASS = "guest", "guest"
 
 
 # --------------------------------------------------------------------------
+
 # keyword matching
 # --------------------------------------------------------------------------
+
+# Ids like ixus115_elph100hs name one camera per sales region; each part is a
+# platform directory name people actually type. Parts that are directory
+# names but never camera names in prose do not ship.
+PART_STOPLIST = {"facebook"}
+
 
 def compact(name):
     """'SX220 HS' -> 'SX220HS'."""
     return re.sub(r"\s+", "", name)
+
+
+def spaced(part):
+    """'elph100hs' -> 'elph 100 hs'.
+
+    Only for alias parts of multi-word ids (never for whole ids like 'a1000',
+    where 'a 1000' would be a prose hazard), and only when the digit run is at
+    least two digits, so nothing ever turns 'g1x' into 'g 1 x'.
+    """
+    if re.fullmatch(r"[a-z]{2,}\d{2,}[a-z]*", part):
+        return re.sub(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])", " ", part)
+    return None
 
 
 def keywords(platform_id, desc, aka):
@@ -50,8 +71,16 @@ def keywords(platform_id, desc, aka):
     visible and correctable in the forum, a missing link is invisible.
     Longest-match-first is the consumer's job, so that 'G7' inside 'G7 X' loses.
     """
+    names = [desc, *aka]
+    if "_" in platform_id:
+        for part in platform_id.split("_"):
+            if len(part) < 3 or part in PART_STOPLIST:
+                continue
+            names.append(part)
+            if spaced(part):
+                names.append(spaced(part))
     out = {platform_id, platform_id.upper()}
-    for name in [desc, *aka]:
+    for name in names:
         name = name.strip()
         if not name:
             continue
@@ -169,10 +198,19 @@ def asset_url(tag, filename):
     return f"https://github.com/{REPO}/releases/download/{tag}/{filename}"
 
 
-def build_cameras(info, tag):
+def build_cameras(info, tag, trunk=None):
+    """Build the cameras.json document.
+
+    `trunk` is the trunk (development) build_info, when available. Cameras only
+    in trunk ship with state "alpha" and no firmware entries -- the mirror only
+    carries stable releases. The changelog is the whole svnlog of the release;
+    consumers match entries to cameras by platform id parts.
+    """
     cameras = []
+    seen = set()
     for family in info["files"]:
         for model in family["models"]:
+            seen.add(model["id"])
             aka = [a.strip() for a in model.get("aka", "").split(",") if a.strip()]
             cameras.append({
                 "id": model["id"],
@@ -181,6 +219,7 @@ def build_cameras(info, tag):
                 "aka": aka,
                 "mid": model.get("mid"),
                 "pid": model.get("pid"),
+                "state": "stable",
                 "match": keywords(model["id"], model["desc"], aka),
                 "firmware": [
                     {
@@ -199,6 +238,33 @@ def build_cameras(info, tag):
                 ],
             })
 
+    if trunk:
+        for family in trunk["files"]:
+            for model in family["models"]:
+                if model["id"] in seen:
+                    continue
+                cameras.append({
+                    "id": model["id"],
+                    "line": family["id"],
+                    "name": model["desc"],
+                    "aka": [],
+                    "mid": model.get("mid"),
+                    "pid": model.get("pid"),
+                    "state": "alpha",
+                    "match": keywords(model["id"], model["desc"], []),
+                    "firmware": [],
+                })
+
+    changelog = [
+        {
+            "revision": e.get("revision", ""),
+            "utc": e.get("utc", ""),
+            "author": e.get("author", ""),
+            "msg": " ".join(e.get("msg", [])),
+        }
+        for e in (info.get("svnlog") or info["build"].get("svnlog") or [])
+    ]
+
     return {
         "mirror": {"repo": REPO, "tag": tag},
         "build": {
@@ -207,6 +273,7 @@ def build_cameras(info, tag):
             "utc": info["build"]["utc"],
             "source": info["build"]["svn_checkout"],
         },
+        "changelog": changelog,
         "cameras": drop_collisions(cameras),
     }
 
@@ -248,7 +315,7 @@ def mode_fetch():
     archive = export_source(info, tag)
     print(f"  {archive} ({os.path.getsize(archive) / 1024 / 1024:.0f} MB)")
 
-    data = build_cameras(info, tag)
+    data = build_cameras(info, tag, fetch_json(TRUNK_BUILD_INFO))
     with open("cameras.json", "w") as f:
         json.dump(data, f, indent=1, sort_keys=False)
     with open(os.path.join(WORK, "build_info.json"), "w") as f:
@@ -266,7 +333,27 @@ def mode_selftest():
     assert "G7" in kw, "short names ship too -- wrong links get fixed in the forum"
 
     kw = keywords("ixus115_elph100hs", "IXUS 115 HS", ["ELPH 100 HS", "IXY 210F"])
-    assert {"IXUS 115 HS", "ELPH 100 HS", "IXY 210F"} <= set(kw)
+    assert {"IXUS 115 HS", "ELPH 100 HS", "IXY 210F", "elph100hs", "elph 100 hs"} <= set(kw)
+
+    # id parts ship; stoplisted and 1-2 char parts never do
+    assert "facebook" not in keywords("n_facebook", "N Facebook", [])
+    assert "n" not in keywords("n_facebook", "N Facebook", [])
+    assert "a 1000" not in keywords("a1000", "A1000 IS", []), "whole ids never get spaced forms"
+
+    # no 'g 1 x' from single-digit runs
+    assert spaced("g1x") is None and spaced("elph100hs") == "elph 100 hs"
+
+    # trunk-only cameras land as alpha with no firmware
+    info = {"build": {"version": "1.6.1", "revision": "6355", "utc": "", "svn_checkout": ""},
+            "files": [{"id": "A", "models": [{"id": "a1000", "desc": "A1000 IS", "mid": 1, "pid": 2,
+                                              "fw": [{"id": "100a", "full": {"file": "f.zip", "size": 1, "sha256": "x"}}]}]}],
+            "svnlog": []}
+    trunk = {"files": [{"id": "A", "models": [{"id": "a1000", "desc": "A1000 IS", "fw": []},
+                                           {"id": "a5900", "desc": "A5900 IS", "fw": []}]}]}
+    doc = build_cameras(info, "1.6.1-6355", trunk)
+    by_id = {c["id"]: c for c in doc["cameras"]}
+    assert by_id["a1000"]["state"] == "stable" and by_id["a1000"]["firmware"]
+    assert by_id["a5900"]["state"] == "alpha" and not by_id["a5900"]["firmware"]
 
     # longest first, so a consumer matching in order can never let 'G7' eat 'G7 X'
     assert keywords("g7x", "G7 X", []).index("G7 X") < keywords("g7x", "G7 X", []).index("G7X")
