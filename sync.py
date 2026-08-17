@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Mirror a CHDK stable release: fetch upstream builds, verify them, emit cameras.json.
 
-Stdlib only. Three modes:
+Stdlib only. Four modes:
 
     sync.py check      print the upstream tag and whether it needs mirroring
     sync.py fetch      download + verify archives, export source, write cameras.json
+    sync.py upload     create the release and upload whatever is not on it yet
     sync.py selftest   run the keyword-matching asserts
 
-The release itself is cut by the workflow with `gh`, not from here.
+`upload` exists because `gh release create <780 files>` does not survive
+contact with GitHub: it fans out uploads with no pacing, no backoff and no
+resume, and a stable CHDK build is ~780 assets. The first secondary-rate-limit
+403 killed the run and discarded the whole release. This uploads serially,
+one second apart per GitHub's own guidance for mutative requests, backs off on
+403/429, and skips assets already present -- so a throttled run resumes on the
+next attempt instead of starting from zero.
 """
 
 import concurrent.futures
+import glob
 import hashlib
 import json
 import os
@@ -18,6 +26,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 
 BUILD_INFO = "https://build.chdk.photos/builds/release/meta/build_info.json"
@@ -29,6 +38,12 @@ REPO = os.environ.get("MIRROR_REPO", "acseven/chdk-release-mirror")
 WORK = "work"
 BIN = os.path.join(WORK, "bin")
 SRC = os.path.join(WORK, "src")
+
+# GitHub asks for at least one second between mutative REST requests. 780
+# assets therefore cost ~13 minutes of pure pacing, which is fine for a job
+# that runs about once a year and has a six hour ceiling.
+UPLOAD_DELAY = 1.0
+UPLOAD_TRIES = 6
 
 # Upstream is Subversion and needs a login. These are the well-known read-only
 # credentials the CHDK community has used for years; there is no signup.
@@ -137,6 +152,63 @@ def release_exists(tag):
         ["gh", "release", "view", tag, "--repo", REPO],
         capture_output=True,
     ).returncode == 0
+
+
+def release_assets(tag):
+    """Asset filenames already on the release. Empty set if there is no release.
+
+    The unit of progress is the asset, not the release: uploads now accumulate
+    across runs, so "the tag exists" says nothing about whether the mirror is
+    complete.
+    """
+    p = subprocess.run(
+        ["gh", "release", "view", tag, "--repo", REPO,
+         "--json", "assets", "--jq", ".assets[].name"],
+        capture_output=True, text=True,
+    )
+    return set(p.stdout.split()) if p.returncode == 0 else set()
+
+
+def expected_assets(info, tag):
+    """Every filename a complete mirror of this build carries."""
+    names = {spec["file"] for _, _, _, spec in each_file(info)}
+    return names | {f"chdk-{tag}-src.tar.gz", "cameras.json"}
+
+
+def upload_one(tag, path):
+    """Upload one asset, retrying through throttling.
+
+    gh exits non-zero for both "GitHub said slow down" and "this file is
+    broken". Only the first is worth retrying, but gh reports it as prose on
+    stderr rather than a distinct exit code, so match the message.
+    """
+    delay = 5
+    for attempt in range(1, UPLOAD_TRIES + 1):
+        p = subprocess.run(
+            ["gh", "release", "upload", tag, path, "--repo", REPO],
+            capture_output=True, text=True,
+        )
+        if p.returncode == 0:
+            return
+        err = (p.stderr or "").strip()
+        # an asset that is already there is success, not a failure to retry
+        if "already exists" in err:
+            return
+        if not retryable(err) or attempt == UPLOAD_TRIES:
+            raise SystemExit(f"upload failed for {path} after {attempt} try(s):\n{err}")
+        print(f"  throttled on {os.path.basename(path)}, retry {attempt}"
+              f"/{UPLOAD_TRIES - 1} in {delay}s", file=sys.stderr)
+        time.sleep(delay)
+        delay *= 2
+
+
+def retryable(err):
+    """Is this gh failure the kind that goes away if we wait?"""
+    e = err.lower()
+    return any(s in e for s in (
+        "rate limit", "secondary rate", "abuse", "403", "429",
+        "502", "503", "504", "timeout", "connection reset", "eof",
+    ))
 
 
 def each_file(info):
@@ -285,12 +357,15 @@ def build_cameras(info, tag, trunk=None):
 def mode_check():
     info = fetch_json(BUILD_INFO)
     tag = tag_for(info)
-    needed = not release_exists(tag)
+    want = expected_assets(info, tag)
+    have = release_assets(tag)
+    missing = want - have
     out = os.environ.get("GITHUB_OUTPUT")
     if out:
         with open(out, "a") as f:
-            f.write(f"tag={tag}\nneeded={'true' if needed else 'false'}\n")
-    print(f"upstream {tag}: {'needs mirroring' if needed else 'already mirrored'}")
+            f.write(f"tag={tag}\nneeded={'true' if missing else 'false'}\n")
+    print(f"upstream {tag}: {len(have & want)}/{len(want)} assets mirrored"
+          f"{f', {len(missing)} missing' if missing else ' -- complete'}")
 
 
 def mode_fetch():
@@ -323,6 +398,48 @@ def mode_fetch():
 
     total_kw = sum(len(c["match"]) for c in data["cameras"])
     print(f"cameras.json: {len(data['cameras'])} models, {total_kw} keywords")
+
+
+def mode_upload():
+    """Create the release if absent, then upload only what is missing.
+
+    Tag is re-derived from upstream rather than taken from argv: it ends up in
+    a git tag and it comes from a third party, so it goes through tag_for's
+    validation on every path that uses it.
+    """
+    info = fetch_json(BUILD_INFO)
+    tag = tag_for(info)
+
+    if not release_exists(tag):
+        subprocess.run(
+            ["gh", "release", "create", tag, "--repo", REPO, "--title", f"CHDK {tag}",
+             "--notes", NOTES.format(tag=tag)],
+            check=True,
+        )
+        print(f"created release {tag}")
+
+    have = release_assets(tag)
+    paths = sorted(glob.glob(os.path.join(BIN, "*")))
+    paths += [os.path.join(WORK, f"chdk-{tag}-src.tar.gz"), "cameras.json"]
+    todo = [p for p in paths if os.path.basename(p) not in have]
+
+    print(f"{len(have)} already uploaded, {len(todo)} to go")
+    for n, path in enumerate(todo, 1):
+        upload_one(tag, path)
+        if n % 50 == 0 or n == len(todo):
+            print(f"  uploaded {n}/{len(todo)}")
+        time.sleep(UPLOAD_DELAY)
+
+    missing = expected_assets(info, tag) - release_assets(tag)
+    if missing:
+        raise SystemExit(f"{len(missing)} asset(s) still missing, e.g. "
+                         f"{', '.join(sorted(missing)[:5])}")
+    print(f"release {tag} complete")
+
+
+NOTES = ("Mirror of upstream CHDK {tag} from build.chdk.photos, with the matching "
+         "SVN source export. Archives are byte-for-byte upstream and were verified "
+         "against the published SHA-256 hashes before upload.")
 
 
 def mode_selftest():
@@ -363,6 +480,18 @@ def mode_selftest():
     drop_collisions(twins)
     assert twins[0]["match"] == [] and twins[1]["match"] == [], "collisions must drop"
 
+    # a complete mirror is archives + source snapshot + cameras.json
+    want = expected_assets(info, "1.6.1-6355")
+    assert want == {"f.zip", "chdk-1.6.1-6355-src.tar.gz", "cameras.json"}, want
+
+    # only throttling and transport faults are worth waiting out; a corrupt
+    # upload must fail loudly rather than be retried six times
+    assert retryable("HTTP 403: You have exceeded a secondary rate limit")
+    assert retryable("HTTP 429: too many requests")
+    assert retryable("Post ...: EOF")
+    assert not retryable("HTTP 422: Validation Failed")
+    assert not retryable("open work/bin/x.zip: no such file or directory")
+
     assert tag_for({"build": {"version": "1.6.1", "revision": "6355"}}) == "1.6.1-6355"
     for bad in ["1.6.1\nfoo", "1.6.1; rm -rf /", "../../etc"]:
         try:
@@ -377,4 +506,5 @@ def mode_selftest():
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "check"
-    {"check": mode_check, "fetch": mode_fetch, "selftest": mode_selftest}[mode]()
+    {"check": mode_check, "fetch": mode_fetch,
+     "upload": mode_upload, "selftest": mode_selftest}[mode]()

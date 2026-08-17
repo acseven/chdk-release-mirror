@@ -2,3 +2,4 @@
 # cameras.json is NOT ignored -- the workflow commits it on purpose, so the
 # extension has a raw URL that does not depend on knowing the current tag.
 work/
+__pycache__/
