@@ -1,0 +1,73 @@
+name: Mirror upstream release
+
+# Stable CHDK releases appear roughly once a year, so this is a cheap weekly
+# poll plus a manual trigger. sync.py check exits without work when the
+# upstream tag already has a release here, which is almost every run.
+on:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create the release; nothing else
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false   # a half-uploaded release is worse than a late one
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No pip install: sync.py is stdlib-only by design. svn is not on the
+      # ubuntu-latest image by default and is the one real dependency.
+      - name: Install subversion
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq subversion
+
+      - name: Self-test
+        run: python3 sync.py selftest
+
+      - id: check
+        name: Check upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 sync.py check
+
+      - name: Fetch and verify
+        if: steps.check.outputs.needed == 'true'
+        run: python3 sync.py fetch
+
+      # One release, all archives plus the source snapshot plus cameras.json.
+      # gh release create uploads in one call; a partial upload leaves the tag
+      # absent, so the next run simply retries the whole thing.
+      - name: Publish release
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # TAG is derived from upstream's build_info.json, i.e. from a third
+          # party. Never interpolate it into the shell -- pass it as an env
+          # var and quote it. sync.py also refuses tags outside [A-Za-z0-9.-].
+          TAG: ${{ steps.check.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "CHDK $TAG" \
+            --notes "Mirror of upstream CHDK $TAG from build.chdk.photos, with the matching SVN source export. Archives are byte-for-byte upstream and were verified against the published SHA-256 hashes before upload." \
+            work/bin/* work/chdk-*-src.tar.gz cameras.json
+
+      # cameras.json is what the Flarum extension reads. Keeping it on the
+      # default branch as well as in the release gives the extension a stable
+      # raw URL that does not need to know the current tag.
+      - name: Commit cameras.json
+        if: steps.check.outputs.needed == 'true'
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add cameras.json
+          git commit -m "cameras.json: $TAG"
+          git push
