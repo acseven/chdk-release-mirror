@@ -66,6 +66,16 @@ def compact(name):
     return re.sub(r"\s+", "", name)
 
 
+def semicompact(name):
+    """'G1 X Mark II' -> 'G1X Mark II': fuse ONLY the leading letter-digit
+    token with the short token after it. People half-de-space model stems
+    ('G1X mark ii'); the full compact ('G1XMarkII') misses it. Fuses nothing
+    new on names whose stem is already one word ('A1000 IS' -> 'A1000IS',
+    already shipped) and never touches 'EOS M3' or single-token names."""
+    return re.sub(r"^([A-Za-z]{1,2}\d+)\s+([A-Za-z]{1,2})\b",
+                  r"\1\2", name, count=1)
+
+
 def spaced(part):
     """'elph100hs' -> 'elph 100 hs'.
 
@@ -100,6 +110,9 @@ def keywords(platform_id, desc, aka):
         if not name:
             continue
         out |= {name, compact(name), compact(name).lower()}
+        semi = semicompact(name)
+        if semi != name:
+            out |= {semi, semi.lower()}
     return sorted(filter(None, out), key=lambda k: (-len(k), k))
 
 
@@ -445,6 +458,13 @@ NOTES = ("Mirror of upstream CHDK {tag} from build.chdk.photos, with the matchin
 def mode_selftest():
     kw = keywords("sx220hs", "SX220 HS", [])
     assert {"sx220hs", "SX220 HS", "SX220HS"} <= set(kw)
+
+    # partially de-spaced stems link too (live report: 'G1X mark ii' missed)
+    kw = keywords("g1x2", "G1 X Mark II", [])
+    assert {"G1X Mark II", "g1x mark ii", "G1X2"} <= set(kw)
+    kw = keywords("g7x2", "G7 X Mark II", [])
+    assert "G7X Mark II" in kw
+    assert semicompact("A1000 IS") == "A1000IS" and semicompact("EOS M3") == "EOS M3"
 
     kw = keywords("g7", "G7", [])
     assert "G7" in kw, "short names ship too -- wrong links get fixed in the forum"
